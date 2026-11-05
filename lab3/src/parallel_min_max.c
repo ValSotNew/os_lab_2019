@@ -1,155 +1,213 @@
-#include <ctype.h>
+#include <errno.h>
+#include <getopt.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
+#include <sys/time.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
-#include <sys/time.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-
-#include <getopt.h>
-
 #include "find_min_max.h"
-#include "utils.h"
+
+struct Worker {
+  pid_t pid;
+  FILE *input;
+};
+
+static int PositiveInt(const char *text) {
+  char *end;
+  errno = 0;
+  long value = strtol(text, &end, 10);
+
+  if (errno == ERANGE || end == text || *end != '\0' ||
+      value < 1 || value > INT_MAX) {
+    return 0;
+  }
+  return (int)value;
+}
+
+static void WriteResult(FILE *output, struct MinMax result) {
+  int written = fprintf(output, "%d %d\n", result.min, result.max);
+  int closed = fclose(output);
+  _exit(written < 0 || closed == EOF ? 1 : 0);
+}
+
+static bool StartFileWorker(int *array, int begin, int end,
+                            struct Worker *worker) {
+  FILE *file = tmpfile();
+  if (file == NULL) {
+    perror("tmpfile");
+    return false;
+  }
+  setbuf(file, NULL);
+
+  pid_t pid = fork();
+  if (pid == -1) {
+    perror("fork");
+    fclose(file);
+    return false;
+  }
+
+  if (pid == 0) {
+    WriteResult(file, GetMinMax(array, begin, end));
+  }
+
+  worker->pid = pid;
+  worker->input = file;
+  return true;
+}
+
+static bool StartPipeWorker(int *array, int begin, int end,
+                            struct Worker *worker) {
+  int fd[2];
+  if (pipe(fd) == -1) {
+    perror("pipe");
+    return false;
+  }
+
+  FILE *input = fdopen(fd[0], "r");
+  if (input == NULL) {
+    perror("fdopen");
+    close(fd[0]);
+    close(fd[1]);
+    return false;
+  }
+
+  pid_t pid = fork();
+  if (pid == -1) {
+    perror("fork");
+    fclose(input);
+    close(fd[1]);
+    return false;
+  }
+
+  if (pid == 0) {
+    fclose(input);
+
+    FILE *output = fdopen(fd[1], "w");
+    if (output == NULL) {
+      perror("fdopen");
+      close(fd[1]);
+      _exit(1);
+    }
+
+    WriteResult(output, GetMinMax(array, begin, end));
+  }
+
+  close(fd[1]);
+  worker->pid = pid;
+  worker->input = input;
+  return true;
+}
+
+static bool CollectResult(struct Worker worker, bool with_files,
+                          struct MinMax *result) {
+  int status;
+  pid_t waited;
+  do {
+    waited = waitpid(worker.pid, &status, 0);
+  } while (waited == -1 && errno == EINTR);
+
+  bool ok = waited == worker.pid && WIFEXITED(status) &&
+            WEXITSTATUS(status) == 0;
+  if (ok) {
+    ok = (!with_files || fseek(worker.input, 0, SEEK_SET) == 0) &&
+         fscanf(worker.input, "%d %d", &result->min, &result->max) == 2;
+  }
+
+  fclose(worker.input);
+  return ok;
+}
 
 int main(int argc, char **argv) {
-  int seed = -1;
-  int array_size = -1;
-  int pnum = -1;
+  int seed = 0;
+  int array_size = 0;
+  int pnum = 0;
   bool with_files = false;
 
-  while (true) {
-    int current_optind = optind ? optind : 1;
+  static const struct option options[] = {
+      {"seed", required_argument, NULL, 's'},
+      {"array_size", required_argument, NULL, 'a'},
+      {"pnum", required_argument, NULL, 'p'},
+      {"by_files", no_argument, NULL, 'f'},
+      {NULL, 0, NULL, 0}};
 
-    static struct option options[] = {{"seed", required_argument, 0, 0},
-                                      {"array_size", required_argument, 0, 0},
-                                      {"pnum", required_argument, 0, 0},
-                                      {"by_files", no_argument, 0, 'f'},
-                                      {0, 0, 0, 0}};
-
-    int option_index = 0;
-    int c = getopt_long(argc, argv, "f", options, &option_index);
-
-    if (c == -1) break;
-
-    switch (c) {
-      case 0:
-        switch (option_index) {
-          case 0:
-            seed = atoi(optarg);
-            // your code here
-            // error handling
-            break;
-          case 1:
-            array_size = atoi(optarg);
-            // your code here
-            // error handling
-            break;
-          case 2:
-            pnum = atoi(optarg);
-            // your code here
-            // error handling
-            break;
-          case 3:
-            with_files = true;
-            break;
-
-          defalut:
-            printf("Index %d is out of options\n", option_index);
-        }
-        break;
-      case 'f':
-        with_files = true;
-        break;
-
-      case '?':
-        break;
-
-      default:
-        printf("getopt returned character code 0%o?\n", c);
+  int option;
+  while ((option = getopt_long(argc, argv, "f", options, NULL)) != -1) {
+    switch (option) {
+      case 's': seed = PositiveInt(optarg); break;
+      case 'a': array_size = PositiveInt(optarg); break;
+      case 'p': pnum = PositiveInt(optarg); break;
+      case 'f': with_files = true; break;
+      default: return 1;
     }
   }
 
-  if (optind < argc) {
-    printf("Has at least one no option argument\n");
+  if (optind != argc || seed == 0 || array_size == 0 || pnum == 0) {
+    fprintf(stderr, "Usage: %s --seed N --array_size N --pnum N [--by_files]\n",
+            argv[0]);
     return 1;
   }
 
-  if (seed == -1 || array_size == -1 || pnum == -1) {
-    printf("Usage: %s --seed \"num\" --array_size \"num\" --pnum \"num\" \n",
-           argv[0]);
+  int *array = calloc(array_size, sizeof(*array));
+  struct Worker *workers = calloc(pnum, sizeof(*workers));
+  if (array == NULL || workers == NULL) {
+    perror("calloc");
+    free(array);
+    free(workers);
     return 1;
   }
-
-  int *array = malloc(sizeof(int) * array_size);
   GenerateArray(array, array_size, seed);
-  int active_child_processes = 0;
 
   struct timeval start_time;
   gettimeofday(&start_time, NULL);
 
-  for (int i = 0; i < pnum; i++) {
-    pid_t child_pid = fork();
-    if (child_pid >= 0) {
-      // successful fork
-      active_child_processes += 1;
-      if (child_pid == 0) {
-        // child process
+  int base = array_size / pnum;
+  int extra = array_size % pnum;
+  int begin = 0;
+  int started = 0;
 
-        // parallel somehow
+  for (; started < pnum; ++started) {
+    int end = begin + base + (started < extra);
 
-        if (with_files) {
-          // use files here
-        } else {
-          // use pipe here
-        }
-        return 0;
-      }
-
-    } else {
-      printf("Fork failed!\n");
-      return 1;
-    }
-  }
-
-  while (active_child_processes > 0) {
-    // your code here
-
-    active_child_processes -= 1;
-  }
-
-  struct MinMax min_max;
-  min_max.min = INT_MAX;
-  min_max.max = INT_MIN;
-
-  for (int i = 0; i < pnum; i++) {
-    int min = INT_MAX;
-    int max = INT_MIN;
-
+    bool launched;
     if (with_files) {
-      // read from files
+      launched = StartFileWorker(array, begin, end, &workers[started]);
     } else {
-      // read from pipes
+      launched = StartPipeWorker(array, begin, end, &workers[started]);
     }
 
-    if (min < min_max.min) min_max.min = min;
-    if (max > min_max.max) min_max.max = max;
+    if (!launched) break;
+    begin = end;
+  }
+
+  bool ok = started == pnum;
+  struct MinMax total = {INT_MAX, INT_MIN};
+
+  for (int i = 0; i < started; ++i) {
+    struct MinMax local;
+    if (!CollectResult(workers[i], with_files, &local)) {
+      fprintf(stderr, "Could not read result from worker %d\n", i);
+      ok = false;
+      continue;
+    }
+
+    if (local.min < total.min) total.min = local.min;
+    if (local.max > total.max) total.max = local.max;
   }
 
   struct timeval finish_time;
   gettimeofday(&finish_time, NULL);
 
-  double elapsed_time = (finish_time.tv_sec - start_time.tv_sec) * 1000.0;
-  elapsed_time += (finish_time.tv_usec - start_time.tv_usec) / 1000.0;
-
   free(array);
+  free(workers);
+  if (!ok) return 1;
 
-  printf("Min: %d\n", min_max.min);
-  printf("Max: %d\n", min_max.max);
-  printf("Elapsed time: %fms\n", elapsed_time);
-  fflush(NULL);
+  double elapsed_ms = (finish_time.tv_sec - start_time.tv_sec) * 1000.0
+                    + (finish_time.tv_usec - start_time.tv_usec) / 1000.0;
+
+  printf("Min: %d\nMax: %d\n", total.min, total.max);
+  printf("Elapsed time: %fms\n", elapsed_ms);
   return 0;
 }
